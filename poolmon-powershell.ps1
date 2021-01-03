@@ -1,3 +1,6 @@
+# Adapted from https://github.com/stevea78/poolmon-powershell
+
+
 <#
 
 .SYNOPSIS
@@ -41,6 +44,8 @@
 
 param (
 	[string]$tags,
+	[string]$tagsExp,
+	[string]$driverPath,
 	[string]$values,
 	[string]$sortvalue = 'TotalUsed',
 	[string]$sortdir = 'Descending',
@@ -49,6 +54,37 @@ param (
 	[string]$tagfile = 'pooltag.txt',
 	[int]$loop = 0
 )
+
+
+function Get-Date-SplunkFormat {
+    param (
+        [parameter(Mandatory=$false)][datetime]$inputDate=(Get-Date)
+    )
+
+    $inputDateString = $inputDate.ToString('MM-dd-yyyy HH:mm:ss.fff zzzz')
+    $inputDateParts = $inputDateString -split " "
+    $inputDateZone = $inputDateParts[2] -replace ":",""
+    $outputDateString  = "$($inputDateParts[0]) $($inputDateParts[1]) $($inputDateZone)"
+    return $outputDateString
+}
+
+function format-splunkLogFromObject {
+    param (
+        [parameter(Mandatory=$true)]$object
+    )
+    $Properties = ($object | get-member -MemberType NoteProperty).Name
+    $Records = @()
+    foreach ($item in $object) {
+        $Record = "$(Get-Date-SplunkFormat) -"
+
+        foreach ($Property in $Properties) {
+            $Record += " $($Property)=`"$($item.$($property))`""
+        }
+        $Records += $Record
+    }
+    return $Records
+}
+
 
 Add-Type -TypeDefinition @'
 using System;
@@ -123,7 +159,7 @@ Function Get-Pool() {
 		}
 	}
 	$tags = $tags -Split ','
-	$datetime = Get-Date
+	$datetime = Get-Date-SplunkFormat
 	$systemPoolTag = New-Object Win32.SYSTEM_POOLTAG
 	$systemPoolTag = $systemPoolTag.GetType()
 	$size = [System.Runtime.InteropServices.Marshal]::SizeOf([type]([Win32.SYSTEM_POOLTAG]))
@@ -137,9 +173,7 @@ Function Get-Pool() {
 		if (!$tags -or ($tags -and $tags -contains $tag)) {
 			$tagResult = $null
 			$tagResult = [PSCustomObject]@{
-				DateTime = Get-Date -Format s $datetime
-				DateTimeUTC = Get-Date -Format s $datetime.ToUniversalTime()
-				Tag = $tag
+				Tag = $tag.trim()
 				PagedAllocs = [int64]$entry.PagedAllocs
 				PagedFrees = [int64]$entry.PagedFrees
 				PagedDiff = [int64]$entry.PagedAllocs - [int64]$entry.PagedFrees
@@ -160,7 +194,7 @@ Function Get-Pool() {
 					$tagResult | Add-Member NoteProperty 'Description' ''
 				}
 			}
-			$tagResult
+            $tagResult
 		}
 		$offset = $offset + $size
 	}
@@ -173,33 +207,34 @@ if ($sortvalue) {
 		$expression += ' -Descending'
 	}
 }
-if ($top -gt 0) {
+if ($top -gt 0 -and !$tagsExp) {
 	$expression += "|Select-Object -First $top"
 }
 if ($values) {
 	$expression += "|Select-Object $values"
 }
-if ($view -eq 'csv') {
-	$expression += '|ConvertTo-Csv -NoTypeInformation'
-} elseif ($view -eq 'grid') {
-	$expression += '|Out-GridView -Title "Kernel Memory Pool (captured $(Get-Date -Format "dd/MM/yyyy HH:mm:ss"))" -Wait'
-} elseif ($view -eq 'table') {
-	$expression += '|Format-Table *'
+
+$Results = Invoke-Expression $expression
+
+
+# exclude results whose paged and nonpaged differences are 0
+$Results = $Results | ?{$_.PagedDiff -ne 0 -or $_.NonPagedDiff -ne 0}
+
+
+# exclude results whose tags match regular expression privded as command line argument
+if ($tagsExp) {
+    $Results = $Results | ?{$_.tag -match $tagsExp}
 }
-if ($loop -gt 0 -and $view -ne 'grid') {
-	$loopcount = 0
-	while ($true) {
-		$loopcount++
-		if ($loopcount -eq 1) {
-			Invoke-Expression $expression
-			if ($view -eq 'csv') {
-				$expression += '|Select-Object -skip 1'
-			}
-		} else {
-			Invoke-Expression $expression
-		}
-		Start-Sleep -Seconds $loop
-	}
-} else {
-	Invoke-Expression $expression
+
+# exclude results whose tags are not included in strings of specified driver in command line argument
+if ($driverpath) {
+    if (Test-Path -Path $driverPath) {
+        $PossibleFlags = & 'C:\Users\admin\Downloads\SysinternalsSuite\strings.exe' -accepteula $driverpath | Select-String -Pattern "^\w{3,4}$"
+        $PossibleFlags = $PossibleFlags -join "|"
+        $tagsExp = "`($($PossibleFlags)`)"
+        $Results = $results | ?{$_.tag -match $tagsExp}
+    }   
 }
+
+format-splunkLogFromObject -object $Results 
+
